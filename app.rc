@@ -1,0 +1,4 @@
+// Copyright (c) 2026 Aanish Bhirud
+// SPDX-License-Identifier: MIT
+
+IDI_ICON1 ICON "assets/icon.ico"
