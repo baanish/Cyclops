@@ -1,0 +1,111 @@
+# LLMs.txt - Cyclops
+
+Guidance for LLM agents working on or with this project. Read this before
+touching the code; most of the non-obvious landmines are documented here.
+
+## What this is
+
+Cyclops is a Windows 11 utility that exposes a Windows Hello IR camera two
+ways: a Qt GUI with live preview + illuminator toggle, and an optional
+Media Foundation virtual camera that any app can open. MIT licensed. Only
+hardware-verified target: NexiGo HelloCam N930W (USB `VID_2B7E&PID_C569`,
+IR interface `MI_02`, 640x360 L8 @ ~30fps).
+
+## Repo map
+
+- `src/ir_capture.{hpp,cpp}` - MF `IMFSourceReader` capture + FACEAUTH
+  extended camera control. Shared by the exe AND the vcam DLL.
+- `src/capture_worker.hpp` - `QThread` owning an `ir_capture`; emits `QImage`
+  frames to the GUI. `open()` must reset `cancel_` (a previous `stop()`
+  leaves it set, which silently skips the read loop).
+- `src/main_window.{hpp,cpp}` - Qt GUI. Restarts are debounced 50ms through
+  `schedule_restart()`; do not call `restart_capture()` directly from
+  multiple paths (a `stop()` landing mid-open strands the preview).
+- `src/vcam_manager.{hpp,cpp}` - device lifecycle: install/uninstall
+  (elevated helper re-launch via `ShellExecuteEx runas`), enable/disable.
+- `src/vcam_ids.hpp` - shared constants: CLSID, friendly name, install dir
+  (`%ProgramData%\Cyclops`, resolved at runtime), flag/log filenames.
+- `src/vcam_flag.hpp` - one-byte `illuminator` flag file; the cross-process
+  control channel between the GUI and the Frame Server-hosted media source.
+- `vcam/` - `CyclopsVcamSource.dll`: hand-rolled COM (no winrt::implements;
+  the SDK cppwinrt doesn't forward interface methods). `vcam_activator`
+  (IMFActivate) -> `vcam_source` (IMFMediaSourceEx) -> `vcam_stream`
+  (IMFMediaStream2 + IKsControl). `vcam_com.hpp` holds `attr_forwarder`
+  (IMFAttributes delegation) and `server_lock` counting for
+  `DllCanUnloadNow`.
+
+## Invariants you must not break
+
+1. **`KSCAMERA_EXTENDEDPROP_FACEAUTH_MODE_DISABLED` is `0x1`, not `0`.**
+   `illumination_on()` is `mode > DISABLED`. Treating any nonzero mode as
+   "on" makes the emitter impossible to re-enable.
+2. **IR sensor cameras are invisible to DirectShow.** Always enumerate
+   `KSCATEGORY_SENSOR_CAMERA` via `MFEnumDeviceSources`.
+3. **`MFStartup` is required before `IMFVirtualCamera` methods.** Without
+   it, `Start` can still succeed but `Stop`/`Remove`/`GetEvent` return
+   `MF_E_SHUTDOWN`, and `enum_video_cameras()` silently returns empty.
+4. **Samples must come from the client-provided `IMFVideoSampleAllocator`.**
+   `GetAllocatorUsage` advertises `UsesProvidedAllocator`; `RequestSample`
+   queues onto `pending_` and the pump fulfills one per fresh camera frame -
+   answering synchronously lets Frame Server free-run the pipeline at
+   thousands of fps. Self-allocated buffers can't cross to the client.
+5. **`cap_` (ir_capture) is owned by the pump thread.** Never call it from
+   stream/source methods; route control through the flag file.
+6. **Never hold `lock_` across `GetEvent` or pump joins** - `GetEvent(0)`
+   blocks until an event exists; a queued MEMediaSample may be what it waits
+   for. Snapshot COM pointers under the lock, call outside. Pump joins are
+   serialized by `join_mu_` and bounded at 5s (`join_pump`); a wedged
+   ReadSample gets TerminateThread rather than hanging Frame Server. Backoff
+   sleeps wait on `stop_event_` so Stop/Shutdown wake immediately, and Start
+   must ResetEvent it (manual-reset). `shutdown_` blocks Start re-entry once
+   Shutdown begins.
+7. **Removal contract: `Remove()` then `Shutdown()` on a fresh binding, no
+   `Start`, no `AddDeviceSourceInfo`.** `Stop` only works on the object that
+   called `Start`; `AddDeviceSourceInfo` on a removal binding makes `Remove`
+   fail.
+8. **`MFCreateVirtualCamera` is create-or-open** keyed on (friendly name,
+   source CLSID, lifetime, access). Calling it just to remove a device will
+   create a phantom - enumerate first, remove only what exists.
+9. **`C:\ProgramData\Cyclops` needs LocalService in its DACL.** Frame Server
+   runs as LocalService and must read the DLL, flag file, and log. The ACL
+   is applied to dir + DLL + flag + log and self-heals on every `enable()`.
+10. **`attr_forwarder`'s store is never nulled after creation** (shutdown
+    paths included) - in-flight attribute calls would dangle.
+11. **The activator owns physical-camera teardown** (ShutdownObject for the
+    associated activation, Shutdown for self-opened sources, dtor as the
+    FS-leak fallback). The stream only ever calls `physical_->Stop()`.
+
+## Frame Server operational notes
+
+- The loaded DLL image is cached per-process. Replacing or renaming the file
+  does not affect already-mapped code. To load a new build: close all camera
+  clients, then `--vcam-disable` + `--vcam-enable`, or restart the
+  `FrameServer` service (elevated). `vcam dll unloaded` in the log confirms
+  release.
+- `RequestSample` only fires while a client is actively streaming. No client,
+  no samples - silence is not a bug.
+- Stale `CyclopsVcamSource.old*.dll` files are expected residue; uninstall
+  sweeps them.
+
+## Debug
+
+- Everything logs to `%ProgramData%\Cyclops\cyclops.log` via `ir_log()`
+  (both the exe and the FS-hosted DLL write it). Key lines:
+  `gui: capture opened` / `gui: first frame delivered`,
+  `vcam stream started, fmt=..., allocator=...`, `vcam: first RequestSample`,
+  `IR emitter on/off`, `vcam dll unloaded`.
+- FACEAUTH SETs from client apps arrive via `IKsControl::KsProperty` and are
+  routed to the flag file - they apply even before the stream runs.
+
+## Testing
+
+No unit tests; verification is a live hardware pass:
+
+1. `cmake --build build --config Release`
+2. Launch `build\Release\cyclops.exe`: preview shows the IR feed.
+3. Flip **IR illuminator** off/on: feed darkens/brightens; log shows
+   `IR emitter off`/`IR emitter on` (not `IR emitter on` twice).
+4. Flip **Windows webcam**: device enumerates as "Cyclops (Windows Hello
+   camera passthrough)"; open it in Camera app/OBS -> live frames.
+5. `--vcam-disable` then `--vcam-enable`: device disappears/returns.
+6. `--vcam-uninstall` (elevated): CLSID key and `%ProgramData%\Cyclops` gone.

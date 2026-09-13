@@ -1,0 +1,8 @@
+; Copyright (c) 2026 Aanish Bhirud
+; SPDX-License-Identifier: MIT
+
+EXPORTS
+    DllCanUnloadNow     PRIVATE
+    DllGetClassObject   PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE

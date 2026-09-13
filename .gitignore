@@ -1,0 +1,24 @@
+# Build trees
+build/
+out/
+*.user
+CMakeUserPresets.json
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+
+# Qt autogen leftovers
+*_autogen/
+
+# Compiled artifacts
+*.obj
+*.lib
+*.exp
+*.dll
+*.exe
+*.pdb
+*.ilk
+
+# Logs
+*.log
