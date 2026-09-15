@@ -18,9 +18,13 @@ Windows Hello IR cameras live in `KSCATEGORY_SENSOR_CAMERA`, which DirectShow do
 
 Tested only on a **NexiGo HelloCam N930W**. Other Hello cameras should work if they expose an IR video stream and the FACEAUTH extended control, but that is not verified - reports welcome.
 
+## Downloads
+
+Prebuilt zips are on the [Releases](https://github.com/baanish/Cyclops/releases) page: tagged versions are stable releases, and the `nightly` pre-release is refreshed on every push to `main`. Unzip anywhere and run `cyclops.exe`; the Qt runtime is included.
+
 ## Building
 
-Needs MSVC, CMake >= 3.21, Qt 6.5+ (Widgets), and Windows SDK >= 10.0.22000.
+Needs MSVC, CMake >= 3.21, Qt 6.5+ (Widgets), and Windows SDK >= 10.0.22000. CI builds on `windows-2022` with Qt 6.8 (`.github/workflows/build.yml`).
 
 ```powershell
 cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="<Qt6 prefix>"
