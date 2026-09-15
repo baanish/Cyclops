@@ -55,10 +55,15 @@ IR interface `MI_02`, 640x360 L8 @ ~30fps).
    blocks until an event exists; a queued MEMediaSample may be what it waits
    for. Snapshot COM pointers under the lock, call outside. Pump joins are
    serialized by `join_mu_` and bounded at 5s (`join_pump`); a wedged
-   ReadSample gets TerminateThread rather than hanging Frame Server. Backoff
+   ReadSample gets the pump *abandoned*, never TerminateThread - a killed
+   thread can orphan MF-internal locks and deadlock Frame Server. The pump
+   self-refs the stream so it can't outlive its members, frees `cap_` on
+   exit, and `cap_abandoned_` permanently fails that stream's Start. Backoff
    sleeps wait on `stop_event_` so Stop/Shutdown wake immediately, and Start
    must ResetEvent it (manual-reset). `shutdown_` blocks Start re-entry once
-   Shutdown begins.
+   Shutdown begins. Start joins a previous pump *before* taking `lock_` and
+   only from STOPPED; PAUSED still has a live pump, so Stop (stream and
+   source) treats it like RUNNING.
 7. **Removal contract: `Remove()` then `Shutdown()` on a fresh binding, no
    `Start`, no `AddDeviceSourceInfo`.** `Stop` only works on the object that
    called `Start`; `AddDeviceSourceInfo` on a removal binding makes `Remove`
@@ -66,14 +71,53 @@ IR interface `MI_02`, 640x360 L8 @ ~30fps).
 8. **`MFCreateVirtualCamera` is create-or-open** keyed on (friendly name,
    source CLSID, lifetime, access). Calling it just to remove a device will
    create a phantom - enumerate first, remove only what exists.
-9. **`C:\ProgramData\Cyclops` needs LocalService in its DACL.** Frame Server
-   runs as LocalService and must read the DLL, flag file, and log. The ACL
-   is applied to dir + DLL + flag + log and self-heals on every `enable()`.
+9. **The `%ProgramData%\Cyclops` ACL model is split by role and protected.**
+   Dir: BU/LS read+execute+create-files, no delete-child, no ProgramData
+   inheritance; DLL: BU/LS read+execute only, `D:P`; flag/log: BU/LS
+   read+write+delete. Owner is Administrators everywhere - an object owned
+   by a user keeps implicit WRITE_DAC. `ir_log` never creates the dir (a
+   user-context creation would leave it weakly secured), and flag/log
+   access refuses hardlinks/reparse points so a user can't turn a
+   LocalService write into an arbitrary file primitive. The flag file is
+   fail-closed: missing or unreadable means emitter off, and install seeds
+   it off (the pump commits it for any vcam client, Cyclops running or not).
+   The elevated install refuses a pre-existing dir that is a reparse point:
+   a user can plant a junction there and redirect the DLL Frame Server loads.
 10. **`attr_forwarder`'s store is never nulled after creation** (shutdown
     paths included) - in-flight attribute calls would dangle.
-11. **The activator owns physical-camera teardown** (ShutdownObject for the
-    associated activation, Shutdown for self-opened sources, dtor as the
-    FS-leak fallback). The stream only ever calls `physical_->Stop()`.
+11. **Physical-camera teardown has exactly one owner.** Normally the
+    activator (ShutdownObject for the associated activation, Shutdown for
+    self-opened sources); `DetachObject` hands ownership to the stream via
+    `adopt_physical`, which runs it in the stream's own Shutdown; a stream
+    that already shut down refuses the handoff and the activator tears down
+    itself. **Frame Server releases the activator right after
+    ActivateObject and keeps only the source**, so the activator dtor is
+    the same handoff, never a teardown: shutting the camera (or the source)
+    down there makes every associated-source open fail. The stream only
+    calls `physical_->Stop()` when it doesn't own teardown. **The pump
+    opens the sensor directly by the persisted symlink first**: the
+    associated (proxy) source streams but exposes no illuminating FACEAUTH
+    mode on the N930W, so it is only the fallback for a sensor we can't
+    open by name. The activator therefore always reads `symlink_attr`.
+12. **`ir_capture` must disconnect adopted sources on reader shutdown.**
+    `MF_SOURCE_READER_DISCONNECT_MEDIASOURCE_ON_SHUTDOWN` keeps reader
+    release from calling `Shutdown()` on a Frame-Server-associated source
+    the activator still owns - without it every `cap_.close()` poisons the
+    associated camera permanently.
+13. **Advertise NV12 only.** MF RGB32 crosses the DirectShow bridge as
+    `BI_RGB` with a negative `biHeight`, which infinite-loops Discord's
+    aspect-ratio reducer. `tools/dshow_enum.exe` enumerates the exposed
+    types without starting capture - run it after any format change and
+    confirm no negative heights. The advertised size and rate come from
+    `probe_source_geometry` (ir_capture), the same stream pick and rounding
+    the pump's capture uses; the type is fixed at Initialize, so a capture
+    of another size is logged and delivered black or sheared.
+14. **Capture metadata is typed `UINT64`.**
+    `MF_CAPTURE_METADATA_FRAME_ILLUMINATION` must be read with `GetUINT64`
+    (tolerating `GetUINT32` drivers); a `GetUINT32` read always fails and
+    silently disables metadata strobe detection. The off-phase drop is
+    gated on `strobing_` - an ungated drop discards every frame on a
+    metadata-tagging driver with the emitter off.
 
 ## Frame Server operational notes
 
@@ -82,6 +126,18 @@ IR interface `MI_02`, 640x360 L8 @ ~30fps).
   clients, then `--vcam-disable` + `--vcam-enable`, or restart the
   `FrameServer` service (elevated). `vcam dll unloaded` in the log confirms
   release.
+- A System-lifetime device can drop out of enumeration when Frame Server
+  restarts. The GUI self-heals: `webcam_desired_` persists in QSettings
+  (`webcam_on`), and `refresh_webcam_status` re-runs `enable()` (bounded, 3
+  attempts) when a desired device is missing. `enable()` is idempotent.
+- `MFVirtualCameraAccess_CurrentUser` binds the device to the installing
+  token's user; over-the-shoulder UAC (admin approving for a standard user)
+  registers it under the wrong account. The unelevated `enable()` self-heals
+  by creating the desktop user's own device; `install_main` logs the
+  mismatch.
+- `KsProperty` is read-only toward the physical camera: GET/BASICSUPPORT
+  forward, SET only ever touches the virtual FACEAUTH flag. A vcam client
+  must never mutate hardware shared with Windows Hello.
 - `RequestSample` only fires while a client is actively streaming. No client,
   no samples - silence is not a bug.
 - Stale `CyclopsVcamSource.old*.dll` files are expected residue; uninstall
@@ -107,5 +163,10 @@ No unit tests; verification is a live hardware pass:
    `IR emitter off`/`IR emitter on` (not `IR emitter on` twice).
 4. Flip **Windows webcam**: device enumerates as "Cyclops (Windows Hello
    camera passthrough)"; open it in Camera app/OBS -> live frames.
-5. `--vcam-disable` then `--vcam-enable`: device disappears/returns.
-6. `--vcam-uninstall` (elevated): CLSID key and `%ProgramData%\Cyclops` gone.
+5. `tools\dshow_enum.exe` (build with `tools\build_enum.bat`): must list
+   only positive-height types for Cyclops. The source advertises NV12 only;
+   the DirectShow bridge synthesizes YUY2 from it, so YUY2 + NV12 at
+   640x360 is the expected listing. Any negative `biHeight` reintroduces
+   the Discord CPU loop.
+6. `--vcam-disable` then `--vcam-enable`: device disappears/returns.
+7. `--vcam-uninstall` (elevated): CLSID key and `%ProgramData%\Cyclops` gone.

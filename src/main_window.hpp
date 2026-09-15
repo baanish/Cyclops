@@ -46,13 +46,20 @@ private:
 
     std::vector<ir_camera_device> sensor_cams_;
     bool webcam_active_ = false; // previewing through the virtual camera
+    bool webcam_desired_ = false; // user toggled it on; outlives enum flicker
     bool ignore_signals_ = false;
     bool restart_scheduled_ = false;
     bool deferred_restart_ = false;
     bool resolution_pending_ = false;
     bool status_pending_ = false;
     bool status_refresh_wanted_ = false;
+    qint64 resolution_since_ = 0; // wedged resolver expiry
+    qint64 status_since_ = 0;     // wedged status-query expiry
+    int heal_failures_ = 0;       // consecutive failed self-heals, capped
+    bool heal_pending_ = false;   // one self-heal enable() in flight at a time
     quint64 restart_seq_ = 0; // drops stale async device resolutions
+    quint64 webcam_op_seq_ = 0;   // bumps per user toggle; stale status results must not re-arm intent
+    bool worker_opened_ = false;  // open finished; the stall watchdog runs on the short budget
 
     int frame_count_ = 0;
     qint64 fps_window_start_ = 0;

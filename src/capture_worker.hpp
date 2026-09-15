@@ -65,8 +65,11 @@ protected:
             const int req = illum_req_.exchange(-1);
             if (req >= 0)
             {
-                if (cap.set_illumination(req == 1))
-                    emit illumination_changed(cap.illumination_on());
+                // Report the committed state whether or not the request took:
+                // a rejected FACEAUTH commit must revert the switch, not leave
+                // it showing a state the hardware never entered.
+                cap.set_illumination(req == 1);
+                emit illumination_changed(cap.illumination_on());
             }
 
             if (cap.read_frame(1000))

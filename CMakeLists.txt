@@ -57,7 +57,7 @@ add_executable(cyclops WIN32
     src/vcam_flag.hpp
     src/vcam_manager.hpp
     src/vcam_manager.cpp)
-qt_add_resources(cyclops "icons" PREFIX "/" FILES assets/icon.png assets/icon_eye.png)
+qt_add_resources(cyclops "icons" PREFIX "/" FILES assets/icon_eye.png)
 target_link_libraries(cyclops PRIVATE Qt6::Widgets
     mfplat mf mfuuid mfreadwrite mfsensorgroup ole32 advapi32 shell32)
 
@@ -78,4 +78,4 @@ add_library(CyclopsVcamSource SHARED
     src/vcam_flag.hpp)
 target_include_directories(CyclopsVcamSource PRIVATE "${CPPWINRT_INCLUDE}" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(CyclopsVcamSource PRIVATE
-    mfplat mf mfuuid mfreadwrite mfsensorgroup ole32 runtimeobject)
+    mfplat mf mfuuid mfreadwrite mfsensorgroup ole32 runtimeobject advapi32)

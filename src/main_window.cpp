@@ -44,12 +44,13 @@ protected:
         p.setClipPath(path);
         if (!frame_.isNull())
         {
-            // Same-size draw is the common case; scaled() would still alloc
-            // and walk the whole image every frame.
-            const QImage s = frame_.size() == size()
-                ? frame_
-                : frame_.scaled(size(), Qt::KeepAspectRatio, Qt::FastTransformation);
-            p.drawImage(QPoint((width() - s.width()) / 2, (height() - s.height()) / 2), s);
+            // Scale on the fly into the target rect: scaled() would allocate
+            // and resample a widget-sized intermediate on every frame, and the
+            // widget is never the sensor's exact size in this layout.
+            const QSize s = frame_.size().scaled(size(), Qt::KeepAspectRatio);
+            const QRect target((width() - s.width()) / 2, (height() - s.height()) / 2,
+                               s.width(), s.height());
+            p.drawImage(target, frame_);
         }
         else if (!empty_.isNull())
         {
@@ -227,13 +228,23 @@ main_window::main_window()
         // The vcam has no extended camera control of its own; in webcam mode
         // the switch stays live and drives the flag file the pump polls.
         illum_switch_->setEnabled(illum_ok || webcam_active_);
-        illum_state_->setText(illum_ok ? QStringLiteral("off") : QStringLiteral("not supported"));
+        // In webcam mode the label tracks the flag file (armed state), which
+        // is what the pump actually applies, not the physical capability.
+        if (webcam_active_)
+            illum_state_->setText(cyclops_vcam::read_illuminator_flag(false)
+                                      ? QStringLiteral("on") : QStringLiteral("off"));
+        else
+            illum_state_->setText(illum_ok ? QStringLiteral("off")
+                                           : QStringLiteral("not supported"));
         ignore_signals_ = false;
         stats_->setText(QStringLiteral("%1x%2 · %3").arg(w).arg(h)
                             .arg(strobing ? QStringLiteral("strobe mode")
                                           : QStringLiteral("continuous")));
         frame_count_ = 0;
         fps_window_start_ = 0;
+        // Frames are due from here; the open itself ran on the longer budget.
+        worker_opened_ = true;
+        last_frame_at_ = QDateTime::currentMSecsSinceEpoch();
     });
     connect(&worker_, &capture_worker::open_failed, this, [this](const QString& why) {
         ir_log(L"gui: open failed: %ls", why.toStdWString().c_str());
@@ -241,6 +252,16 @@ main_window::main_window()
         live_->hide();
         preview_->set_text(why);
         stats_->setText(QString());
+        ignore_signals_ = true;
+        illum_switch_->setEnabled(webcam_switch_->isChecked()); // flag still arm-able
+        ignore_signals_ = false;
+        // The device list that produced this symlink is suspect (Frame Server
+        // churn): rescan sensors and re-check the vcam registration.
+        sensor_cams_.clear();
+        camera_box_->clear();
+        camera_box_->setVisible(false);
+        refresh_webcam_status();
+        schedule_restart();
     });
     connect(&worker_, &capture_worker::frame_ready, this, [this](const QImage& img) {
         preview_->set_frame(img);
@@ -263,6 +284,9 @@ main_window::main_window()
         }
     });
     connect(&worker_, &capture_worker::illumination_changed, this, [this](bool on) {
+        ignore_signals_ = true;
+        illum_switch_->setChecked(on); // a rejected commit lands the switch back
+        ignore_signals_ = false;
         illum_state_->setText(on ? QStringLiteral("on") : QStringLiteral("off"));
     });
     // Permanent connection: a per-defer SingleShotConnection can be connected
@@ -287,6 +311,13 @@ main_window::main_window()
     connect(webcam_switch_, &QAbstractButton::toggled, this, [this](bool on) {
         if (ignore_signals_)
             return;
+        webcam_desired_ = on;
+        ++webcam_op_seq_;
+        // Persisted intent: a device that drops out of enumeration before the
+        // app starts (Frame Server restart) can only self-heal if the "user
+        // wanted it on" fact survives the session.
+        QSettings(QStringLiteral("Cyclops"), QStringLiteral("Cyclops"))
+            .setValue(QStringLiteral("webcam_on"), on);
         ignore_signals_ = true;
         webcam_switch_->setChecked(!on); // revert until the operation proves out
         ignore_signals_ = false;
@@ -328,19 +359,65 @@ main_window::main_window()
             schedule_restart();
     });
 
+    // Restore intent before the first status check so self-heal works when
+    // the device vanished while the app wasn't running.
+    webcam_desired_ = QSettings(QStringLiteral("Cyclops"), QStringLiteral("Cyclops"))
+                          .value(QStringLiteral("webcam_on"), false).toBool();
+
     refresh_webcam_status();
     schedule_restart();
 
-    // A wedged Frame Server or driver leaves the last frame on screen
-    // forever; surface the stall instead of a silent freeze.
+    // Watchdog: no frames for 6s means the read is wedged inside Frame
+    // Server or the driver. The thread is killed and restarted; a QThread
+    // destroyed while running crashes the process, so terminate+wait is the
+    // only exit from a truly stuck call. An open is slower than a read (a
+    // vcam open activates the source inside Frame Server, which opens the
+    // sensor and waits for its own first frame, then the illuminator settles),
+    // so it gets a longer budget before it counts as wedged.
     auto* stall_timer = new QTimer(this);
     stall_timer->setInterval(2000);
     connect(stall_timer, &QTimer::timeout, this, [this] {
-        if (worker_.isRunning() && last_frame_at_
-            && QDateTime::currentMSecsSinceEpoch() - last_frame_at_ > 5000)
-            stats_->setText(QStringLiteral("camera stalled - flip Windows webcam off/on to restart it"));
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+        const qint64 stall_budget = worker_opened_ ? 6000 : 20000;
+        if (worker_.isRunning() && last_frame_at_ && now - last_frame_at_ > stall_budget)
+        {
+            ir_log(L"gui: no frames for 6s, restarting capture worker");
+            stats_->setText(QStringLiteral("camera stalled - restarting"));
+            last_frame_at_ = 0; // one restart per stall, not one per tick
+            worker_.stop();
+            if (!worker_.wait(4000))
+            {
+                worker_.terminate();
+                worker_.wait(2000);
+            }
+            deferred_restart_ = false;
+            schedule_restart();
+        }
+
+        // Liveness for pending guards: a resolver or status query stuck in an
+        // FS RPC must not hold its flag forever and block all future work.
+        if (resolution_pending_ && resolution_since_ && now - resolution_since_ > 30000)
+        {
+            ir_log(L"gui: device resolution wedged, releasing guard");
+            resolution_pending_ = false;
+            schedule_restart();
+        }
+        if (status_pending_ && status_since_ && now - status_since_ > 30000)
+        {
+            ir_log(L"gui: webcam status query wedged, releasing guard");
+            status_pending_ = false;
+            refresh_webcam_status();
+        }
     });
     stall_timer->start();
+
+    // Device registration can change out from under us (Frame Server
+    // restart, external tools); poll cheaply and self-heal.
+    auto* status_timer = new QTimer(this);
+    status_timer->setInterval(10000);
+    connect(status_timer, &QTimer::timeout, this, [this] { refresh_webcam_status(); });
+    status_timer->start();
 }
 
 // restart_capture calls arrive in bursts (ctor refresh + start, toggle +
@@ -395,6 +472,7 @@ void main_window::restart_capture()
     if (resolution_pending_)
         return; // the in-flight resolver is now stale; its finish reschedules
     resolution_pending_ = true;
+    resolution_since_ = QDateTime::currentMSecsSinceEpoch();
     const bool want_vcam = webcam_switch_->isChecked();
     const bool need_sensors = sensor_cams_.empty();
     auto* res = new cam_resolution;
@@ -430,6 +508,7 @@ void main_window::restart_capture()
         delete res;
         t->deleteLater();
         resolution_pending_ = false;
+        resolution_since_ = 0;
 
         if (seq != restart_seq_ || worker_.isRunning() || !preview_switch_->isChecked())
         {
@@ -452,11 +531,12 @@ void main_window::restart_capture()
 
         ignore_signals_ = true;
         illum_switch_->setEnabled(true);
-        illum_switch_->setChecked(webcam_active_ ? cyclops_vcam::read_illuminator_flag(true) : false);
+        illum_switch_->setChecked(webcam_active_ ? cyclops_vcam::read_illuminator_flag(false) : false);
         illum_state_->setText(illum_switch_->isChecked() ? QStringLiteral("on") : QStringLiteral("off"));
         ignore_signals_ = false;
 
         ir_log(L"gui: opening %s", via_vcam ? L"vcam" : L"sensor");
+        worker_opened_ = false;
         last_frame_at_ = QDateTime::currentMSecsSinceEpoch();
         worker_.open(symlink);
     });
@@ -465,18 +545,28 @@ void main_window::restart_capture()
 
 void main_window::apply_illuminator(bool on)
 {
-    if (webcam_switch_->isChecked())
+    if (webcam_switch_->isChecked() || webcam_active_)
     {
         // The media source inside Frame Server polls the flag file and applies
-        // FACEAUTH to the physical camera itself; with the preview off it is
-        // simply armed until a client opens the virtual camera.
-        cyclops_vcam::write_illuminator_flag(on);
+        // FACEAUTH to the physical camera itself; with the preview off the
+        // flag is simply armed until a client opens the virtual camera.
+        if (!cyclops_vcam::write_illuminator_flag(on))
+        {
+            // The pump keeps applying whatever the file still says; show that.
+            ir_log(L"gui: illuminator flag write failed (%lu)", GetLastError());
+            const bool actual = cyclops_vcam::read_illuminator_flag(false);
+            ignore_signals_ = true;
+            illum_switch_->setChecked(actual);
+            ignore_signals_ = false;
+            illum_state_->setText(actual ? QStringLiteral("on") : QStringLiteral("off"));
+            return;
+        }
         illum_state_->setText(on ? QStringLiteral("on") : QStringLiteral("off"));
+        if (webcam_active_)
+            return; // the pump owns the physical camera; don't double-drive it
     }
-    else
-    {
+    if (!webcam_active_)
         worker_.request_illumination(on);
-    }
 }
 
 void main_window::refresh_webcam_status()
@@ -487,14 +577,17 @@ void main_window::refresh_webcam_status()
         return;
     }
     status_pending_ = true;
+    status_since_ = QDateTime::currentMSecsSinceEpoch();
 
     auto* res = new std::pair<bool, bool>{}; // registered, enumerated
     auto* t = QThread::create([res] {
         res->first = cyclops_vcam::is_registered();
         res->second = cyclops_vcam::is_enumerated();
     });
-    connect(t, &QThread::finished, this, [this, t, res] {
+    const quint64 op = webcam_op_seq_;
+    connect(t, &QThread::finished, this, [this, t, res, op] {
         status_pending_ = false;
+        status_since_ = 0;
         const bool registered = res->first;
         const bool enumerated = res->second;
         delete res;
@@ -507,6 +600,43 @@ void main_window::refresh_webcam_status()
                                                   .arg(QString::fromWCharArray(cyclops_vcam::friendly_name))
                                           : QStringLiteral("installed, off"));
         ignore_signals_ = false;
+
+        // An enumerated device means the user enabled it at some point; treat
+        // it as desired (and persist that) so a later drop-out self-heals.
+        // Skipped while an enable/disable op is in flight (switch disabled)
+        // or when a toggle landed after this query started, so a stale
+        // reading can't re-arm what the user just turned off.
+        if (enumerated && !webcam_desired_ && webcam_switch_->isEnabled()
+            && op == webcam_op_seq_)
+        {
+            webcam_desired_ = true;
+            QSettings(QStringLiteral("Cyclops"), QStringLiteral("Cyclops"))
+                .setValue(QStringLiteral("webcam_on"), true);
+        }
+
+        // Self-heal: a System-lifetime device can drop out of enumeration
+        // after a Frame Server restart; while the user wants it on, re-enable
+        // (MFCreateVirtualCamera + Start recreates the device entry).
+        if (enumerated)
+            heal_failures_ = 0;
+        else if (registered && webcam_desired_ && webcam_switch_->isEnabled()
+                 && !heal_pending_ && heal_failures_ < 3)
+        {
+            // One at a time: enable() is a Frame Server round-trip that can
+            // outlast the 10s poll, and stacking them races the device create.
+            heal_pending_ = true;
+            auto* ok = new bool(false);
+            auto* heal = QThread::create([ok] { *ok = cyclops_vcam::enable(nullptr); });
+            connect(heal, &QThread::finished, this, [this, heal, ok] {
+                heal_pending_ = false;
+                if (!*ok)
+                    ++heal_failures_;
+                delete ok;
+                heal->deleteLater();
+                QTimer::singleShot(1500, this, [this] { refresh_webcam_status(); });
+            });
+            heal->start();
+        }
 
         if (status_refresh_wanted_)
         {

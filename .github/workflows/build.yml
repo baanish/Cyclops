@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.*"
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Stage
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\Release\cyclops.exe, build\Release\CyclopsVcamSource.dll dist\
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist\cyclops.exe
+          # MSVC CRT next to the exe, so a machine without the VC++ redistributable still runs it.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT\*.dll" | Copy-Item -Destination dist\
+          Copy-Item README.md, LICENSE dist\
+          $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'nightly' }
+          Compress-Archive -Path dist\* -DestinationPath "cyclops-$ver-win64.zip"
+          "ZIP=cyclops-$ver-win64.zip" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cyclops-win64
+          path: ${{ env.ZIP }}
+
+      # Every push to main refreshes the rolling "nightly" pre-release, so a
+      # tester always has the latest build without anyone cutting a version.
+      - name: Nightly pre-release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: Nightly (${{ github.sha }})
+          prerelease: true
+          files: ${{ env.ZIP }}
+          body: Rolling build of `main` at ${{ github.sha }}. Not a stable release.
+
+      # A v* tag makes a proper release: `git tag v0.1.0 && git push --tags`.
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true

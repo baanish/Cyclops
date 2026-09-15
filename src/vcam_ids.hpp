@@ -44,6 +44,7 @@ inline std::wstring install_dir()
 }
 
 constexpr wchar_t log_name[] = L"cyclops.log";
+constexpr wchar_t old_log_name[] = L"cyclops.old.log"; // ir_log rotates into this
 constexpr wchar_t illuminator_flag[] = L"illuminator";
 
 } // ns cyclops_vcam

@@ -25,34 +25,52 @@ HRESULT cyclops_media_source::Initialize(IMFMediaSource* physical, const std::ws
         return E_OUTOFMEMORY;
     hr = stream_->Initialize(this, physical, physical_symlink);
     if (FAILED(hr))
+    {
+        // The stream holds a ref back on this source; leaving it half-built
+        // would pin the pair in a reference cycle.
+        stream_->Shutdown();
+        stream_ = nullptr;
         return hr;
+    }
 
-    // Sensor profiles tell camera-aware clients this is a plain color stream;
-    // the frame-rate filter tracks whatever the physical camera reported.
+    // Sensor profiles tell camera-aware clients this is a plain color stream.
+    // Tightened to the one type we actually deliver: NV12 at the sensor's
+    // size and rate, not a wildcard.
     winrt::com_ptr<IMFSensorProfileCollection> profiles;
     if (SUCCEEDED(MFCreateSensorProfileCollection(profiles.put())))
     {
         winrt::com_ptr<IMFSensorProfile> profile;
         if (SUCCEEDED(MFCreateSensorProfile(KSCAMERAPROFILE_Legacy, 0, nullptr, profile.put())))
         {
-            wchar_t filter[64];
-            swprintf_s(filter, L"((RES==;FRT<=%d,1;SUT==))", stream_->fps());
-            profile->AddProfileFilter(0, filter);
-            profiles->AddProfile(profile.get());
+            wchar_t filter[96];
+            swprintf_s(filter, L"((RES==%d,%d;FRT<=%d,1;SUT=={3231564e-0000-0010-8000-00aa00389b71}))",
+                       stream_->width(), stream_->height(), stream_->fps());
+            if (SUCCEEDED(profile->AddProfileFilter(0, filter)))
+                profiles->AddProfile(profile.get());
         }
-        store->SetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION, profiles.get());
+        if (profiles->GetProfileCount() > 0)
+            store->SetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION, profiles.get());
     }
 
     winrt::com_ptr<IMFStreamDescriptor> sd;
     hr = stream_->GetStreamDescriptor(sd.put());
-    if (FAILED(hr))
-        return hr;
     IMFStreamDescriptor* sds[1] = { sd.get() };
-    hr = MFCreatePresentationDescriptor(1, sds, descriptor_.put());
-    if (FAILED(hr))
+    if (FAILED(hr)
+        || FAILED(hr = MFCreatePresentationDescriptor(1, sds, descriptor_.put()))
+        || FAILED(hr = MFCreateEventQueue(queue_.put())))
+    {
+        stream_->Shutdown();
+        stream_ = nullptr;
+        descriptor_ = nullptr;
         return hr;
+    }
+    return S_OK;
+}
 
-    return MFCreateEventQueue(queue_.put());
+bool cyclops_media_source::adopt_physical(IMFActivate* act)
+{
+    winrt::slim_lock_guard g(lock_);
+    return stream_ && stream_->adopt_physical(act);
 }
 
 int cyclops_media_source::stream_index_by_id(DWORD id)
@@ -139,19 +157,21 @@ STDMETHODIMP cyclops_media_source::Pause()
 
 STDMETHODIMP cyclops_media_source::Shutdown()
 {
+    winrt::com_ptr<IMFMediaEventQueue> queue;
     winrt::com_ptr<cyclops_media_stream> stream;
     {
         winrt::slim_lock_guard g(lock_);
         if (!queue_)
             return MF_E_SHUTDOWN;
 
-        queue_->Shutdown();
+        queue = queue_;
         queue_ = nullptr;
         descriptor_ = nullptr;
         stream = stream_;
     }
-    // Outside lock_: stream shutdown joins the capture pump (bounded), and
-    // the event methods Frame Server keeps calling must not queue behind it.
+    // Both off-lock: queue_->Shutdown() can dispatch pending event callbacks
+    // that reenter our methods, and stream shutdown joins the capture pump.
+    queue->Shutdown();
     if (stream)
         stream->Shutdown();
     ir_log(L"vcam source shutdown");
@@ -180,7 +200,9 @@ STDMETHODIMP cyclops_media_source::Start(IMFPresentationDescriptor* pd, const GU
     if (FAILED(hr))
         return hr;
 
-    const bool running = stream_->state() == MF_STREAM_STATE_RUNNING;
+    // PAUSED counts as live: the stream already exists on the client side, so
+    // re-selecting it is an update, and deselecting it must stop its pump.
+    const bool running = stream_->state() != MF_STREAM_STATE_STOPPED;
     if (selected)
     {
         descriptor_->SelectStream(0);
@@ -198,7 +220,12 @@ STDMETHODIMP cyclops_media_source::Start(IMFPresentationDescriptor* pd, const GU
             handler->GetCurrentMediaType(type.put());
         hr = stream_->Start(type.get());
         if (FAILED(hr))
+        {
+            // The stream event already went out; retract the selection so the
+            // client doesn't hold a stream that never started.
+            descriptor_->DeselectStream(0);
             return hr;
+        }
     }
     else
     {
@@ -222,7 +249,7 @@ STDMETHODIMP cyclops_media_source::Stop()
         winrt::slim_lock_guard g(lock_);
         if (!queue_ || !descriptor_)
             return MF_E_SHUTDOWN;
-        if (stream_->state() == MF_STREAM_STATE_RUNNING)
+        if (stream_->state() != MF_STREAM_STATE_STOPPED) // RUNNING or PAUSED
             stream = stream_;
     }
     if (stream)
@@ -278,10 +305,15 @@ STDMETHODIMP cyclops_media_source::SetD3DManager(IUnknown* manager)
 
 // ---- IMFGetService ------------------------------------------------------------
 
-STDMETHODIMP cyclops_media_source::GetService(REFGUID, REFIID, LPVOID* ppv)
+STDMETHODIMP cyclops_media_source::GetService(REFGUID service, REFIID riid, LPVOID* ppv)
 {
-    if (ppv)
-        *ppv = nullptr;
+    if (!ppv)
+        return E_POINTER;
+    *ppv = nullptr;
+    // The one service a media source must answer: a request for the source
+    // itself.
+    if (service == MF_MEDIASOURCE_SERVICE)
+        return QueryInterface(riid, ppv);
     return MF_E_UNSUPPORTED_SERVICE;
 }
 

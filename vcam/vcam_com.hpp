@@ -7,9 +7,7 @@
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
-#include <mfreadwrite.h>
 #include <mferror.h>
-#include <mfcaptureengine.h>
 #include <ks.h>
 #include <ksproxy.h>
 #include <ksmedia.h>
@@ -104,9 +102,3 @@ struct attr_forwarder : I
     STDMETHOD(GetItemByIndex)(UINT32 i, GUID* k, PROPVARIANT* v) override { ENSURE_STORE(); return store->GetItemByIndex(i, k, v); }
     STDMETHOD(CopyAllItems)(IMFAttributes* d) override { ENSURE_STORE(); return store->CopyAllItems(d); }
 };
-
-inline std::wstring guid_str(REFGUID g)
-{
-    wchar_t buf[40];
-    return StringFromGUID2(g, buf, _countof(buf)) ? buf : L"?";
-}

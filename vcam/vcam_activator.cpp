@@ -9,7 +9,14 @@
 
 cyclops_activator::~cyclops_activator()
 {
-    // Covers Frame Server releasing us without ShutdownObject.
+    // Frame Server releases the activator right after ActivateObject and
+    // keeps only the media source, so this is not a teardown signal: the
+    // live source takes over the physical session exactly as DetachObject
+    // hands it over (shutting the camera down here is what made every
+    // associated-source open fail and fall back to a direct open). Only
+    // when no live source can own it is the camera closed here.
+    if (source_ && source_->adopt_physical(physical_activate_.get()))
+        return;
     shutdown_physical();
 }
 
@@ -44,6 +51,7 @@ STDMETHODIMP cyclops_activator::ActivateObject(REFIID riid, void** ppv)
     if (!ppv)
         return E_POINTER;
     *ppv = nullptr;
+    std::lock_guard<std::mutex> g(mu_);
     HRESULT hr = ensure_store();
     if (FAILED(hr))
         return hr;
@@ -52,8 +60,18 @@ STDMETHODIMP cyclops_activator::ActivateObject(REFIID riid, void** ppv)
     if (SUCCEEDED(store->GetUINT32(MF_FRAMESERVER_CLIENTCONTEXT_CLIENTPID_, &pid)) && pid)
         ir_log(L"vcam activating for client pid %lu", pid);
 
-    // ActivateObject can run more than once; a prior activation's camera
-    // resources would leak without teardown first.
+    // IMFActivate contract: repeat calls hand back the same object until
+    // ShutdownObject or DetachObject. A source the client already shut down
+    // itself can't be handed out again; its camera resources are torn down
+    // (source first, so nothing pumps through a camera being shut down) and
+    // a fresh pair is built.
+    if (source_ && !source_->is_shutdown())
+        return source_->QueryInterface(riid, ppv);
+    if (source_)
+    {
+        source_->Shutdown();
+        source_ = nullptr;
+    }
     shutdown_physical();
     physical_symlink_.clear();
 
@@ -71,14 +89,21 @@ STDMETHODIMP cyclops_activator::ActivateObject(REFIID riid, void** ppv)
         {
             winrt::com_ptr<IUnknown> unk;
             if (SUCCEEDED(coll->GetElement(0, unk.put()))
-                && SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(physical_activate_.put())))
-                && SUCCEEDED(physical_activate_->ActivateObject(IID_PPV_ARGS(physical_.put()))))
-                ir_log(L"vcam: using associated camera source");
+                && SUCCEEDED(unk->QueryInterface(IID_PPV_ARGS(physical_activate_.put()))))
+            {
+                if (SUCCEEDED(physical_activate_->ActivateObject(IID_PPV_ARGS(physical_.put()))))
+                    ir_log(L"vcam: using associated camera source");
+                else
+                    physical_activate_ = nullptr; // failed activate owns nothing
+            }
         }
     }
 
-    // 2. The symlink persisted at IMFVirtualCamera creation time.
-    if (!physical_)
+    // 2. The symlink persisted at IMFVirtualCamera creation time. Always
+    //    read: the stream opens the sensor directly by it even when an
+    //    associated source exists, because the Frame Server proxy source
+    //    exposes no illuminating FACEAUTH mode (measured on the N930W) and
+    //    the emitter is the point of the device.
     {
         WCHAR* link = nullptr;
         UINT32 cch = 0;
@@ -86,9 +111,13 @@ STDMETHODIMP cyclops_activator::ActivateObject(REFIID riid, void** ppv)
         {
             physical_symlink_ = link;
             CoTaskMemFree(link);
-
-            winrt::com_ptr<IMFAttributes> attrs;
-            MFCreateAttributes(attrs.put(), 2);
+        }
+    }
+    if (!physical_ && !physical_symlink_.empty())
+    {
+        winrt::com_ptr<IMFAttributes> attrs;
+        if (SUCCEEDED(MFCreateAttributes(attrs.put(), 2)))
+        {
             attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
                            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
             attrs->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
@@ -111,12 +140,17 @@ STDMETHODIMP cyclops_activator::ActivateObject(REFIID riid, void** ppv)
     // Pass our store so the source can surface Frame Server's attributes.
     hr = source_->Initialize(physical_.get(), physical_symlink_, this);
     if (FAILED(hr))
+    {
+        source_ = nullptr;
+        shutdown_physical(); // a failed activation owns nothing it resolved
         return hr;
+    }
     return source_->QueryInterface(riid, ppv);
 }
 
 STDMETHODIMP cyclops_activator::ShutdownObject()
 {
+    std::lock_guard<std::mutex> g(mu_);
     if (source_)
     {
         source_->Shutdown();
@@ -129,12 +163,20 @@ STDMETHODIMP cyclops_activator::ShutdownObject()
 
 STDMETHODIMP cyclops_activator::DetachObject()
 {
+    std::lock_guard<std::mutex> g(mu_);
     // Ownership of everything transfers to the caller: the source may still
     // be streaming, so releasing our refs must not tear the camera out from
-    // under it. The stream's own Shutdown stops the physical capture.
+    // under it. Physical-session teardown moves onto the stream, which runs
+    // ShutdownObject/Shutdown in its own Shutdown. A source that already shut
+    // down can't take it, so the camera session is closed here instead.
+    if (source_ && source_->adopt_physical(physical_activate_.get()))
+    {
+        physical_ = nullptr;
+        physical_activate_ = nullptr;
+        physical_self_opened_ = false;
+    }
+    else
+        shutdown_physical();
     source_ = nullptr;
-    physical_ = nullptr;
-    physical_activate_ = nullptr;
-    physical_self_opened_ = false;
     return S_OK;
 }

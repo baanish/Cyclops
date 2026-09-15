@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "vcam_com.hpp"
 
 struct cyclops_media_source;
@@ -50,6 +52,9 @@ struct cyclops_activator : attr_forwarder<IMFActivate>
 private:
     server_lock lock_guard_;
     LONG refs_ = 1;
+    // Activate/Shutdown/Detach run on Frame Server threads with no ordering
+    // guarantee; serialize them or a second activation can race teardown.
+    std::mutex mu_;
     // The physical IR camera, resolved at activation. Owned here so the right
     // cleanup runs (ShutdownObject for frame-server-provided activates,
     // Shutdown for sources we opened ourselves).

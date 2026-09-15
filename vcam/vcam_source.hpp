@@ -84,6 +84,14 @@ struct cyclops_media_source
     ~cyclops_media_source(); // out-of-line: stream_ member is forward-declared here
     HRESULT Initialize(IMFMediaSource* physical, const std::wstring& physical_symlink,
                        IMFAttributes* activator_attrs);
+    // DetachObject handoff: moves physical-camera teardown onto the stream.
+    // False when the stream can no longer take it (already shut down).
+    bool adopt_physical(IMFActivate* act);
+    bool is_shutdown()
+    {
+        winrt::slim_lock_guard g(lock_);
+        return !queue_;
+    }
 
 private:
     int stream_index_by_id(DWORD id);

@@ -62,9 +62,16 @@ struct cyclops_class_factory : IClassFactory
     STDMETHOD(LockServer)(BOOL lock) override
     {
         if (lock)
+        {
             InterlockedIncrement(&server_locks());
-        else
-            InterlockedDecrement(&server_locks());
+            return S_OK;
+        }
+        // A stray unlock must not drive the count negative: a negative count
+        // pins the module forever.
+        LONG v = server_locks();
+        while (v > 0
+               && InterlockedCompareExchange(&server_locks(), v - 1, v) != v)
+            v = server_locks();
         return S_OK;
     }
 
@@ -76,10 +83,17 @@ struct cyclops_class_factory : IClassFactory
 
 STDAPI DllCanUnloadNow()
 {
+    // COM polls this repeatedly; log once per unload transition, not per poll.
     // Logged here rather than DllMain: loader lock makes file I/O unsafe there.
-    if (server_locks() == 0)
+    static std::atomic_bool unload_logged{ false };
+    if (server_locks() != 0)
+    {
+        unload_logged.store(false);
+        return S_FALSE;
+    }
+    if (!unload_logged.exchange(true))
         ir_log(L"vcam dll unloaded");
-    return server_locks() ? S_FALSE : S_OK;
+    return S_OK;
 }
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
@@ -105,7 +119,11 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv)
 STDAPI DllRegisterServer()
 {
     wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW((HMODULE)&__ImageBase, path, _countof(path));
+    const DWORD path_len = GetModuleFileNameW((HMODULE)&__ImageBase, path, _countof(path));
+    // Zero means failure; a full buffer means the path was truncated and would
+    // register a broken DLL location.
+    if (path_len == 0 || path_len >= _countof(path))
+        return HRESULT_FROM_WIN32(path_len ? ERROR_INSUFFICIENT_BUFFER : GetLastError());
 
     const std::wstring key_path = std::wstring(L"Software\\Classes\\CLSID\\") + cyclops_vcam::clsid_str;
     const std::wstring inproc_path = key_path + L"\\InprocServer32";
@@ -130,5 +148,7 @@ STDAPI DllRegisterServer()
 STDAPI DllUnregisterServer()
 {
     const std::wstring key_path = std::wstring(L"Software\\Classes\\CLSID\\") + cyclops_vcam::clsid_str;
-    return HRESULT_FROM_WIN32(RegDeleteTreeW(HKEY_LOCAL_MACHINE, key_path.c_str()));
+    const LSTATUS st = RegDeleteTreeW(HKEY_LOCAL_MACHINE, key_path.c_str());
+    // Unregister must be idempotent: an absent key is the goal state.
+    return st == ERROR_FILE_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32(st);
 }

@@ -29,6 +29,12 @@ std::vector<ir_camera_device> enum_sensor_cameras();
 // KSCATEGORY_VIDEO_CAMERA: ordinary webcams, including virtual ones.
 std::vector<ir_camera_device> enum_video_cameras();
 
+// Frame size and rate of the stream ir_capture would read from this source
+// (the Infrared-tagged one, else the first renderable). The vcam advertises
+// its media type from this so it matches what capture actually delivers.
+// Outputs are only written when the source reports them.
+bool probe_source_geometry(IMFMediaSource* source, int& width, int& height, int& fps);
+
 class ir_capture
 {
 public:
@@ -51,22 +57,27 @@ public:
 
     // Fill out_ with one displayable L8 frame. When strobing, off-phase
     // (unlit) frames are dropped. Returns false if nothing arrived in time.
+    // A ReadSample wedged in the driver can outlive the bound; callers bound
+    // that case with their own watchdog.
     bool read_frame(int timeout_ms);
 
     const std::vector<uint8_t>& pixels() const { return buf_; }
-    double last_mean() const { return last_mean_; }
     int width() const { return width_; }
     int height() const { return height_; }
     int fps() const { return fps_; }
 
 private:
+    // skipped: ReadSample returned (tick, end of stream, or a strobe off-phase
+    // frame) but produced no frame; only failed warrants backing off.
+    enum class read_result { frame, skipped, failed };
+
     bool start_with_source();
-    bool read_sample();          // one ReadSample into buf_; fills last_mean_
+    bool read_current_type();    // refresh width_/height_/fps_; false = unusable
+    read_result read_sample();   // one ReadSample into buf_; fills last_mean_
     bool probe_illumination();   // find a stream index + mode that can illuminate
     bool apply_illumination(unsigned long long mode); // commit a FACEAUTH mode
     bool sample_is_lit() const;
 
-    std::wstring symlink_;
     IMFMediaSource* source_ = nullptr;
     bool source_owned_ = false;
     IMFSourceReader* reader_ = nullptr;
@@ -81,7 +92,10 @@ private:
 
     std::vector<uint8_t> buf_;
     int width_ = 0, height_ = 0, fps_ = 0;
+    int stride_ = 0;         // MF_MT_DEFAULT_STRIDE for buffers without a 2D interface
+    bool type_ok_ = true;    // false after a renegotiation to a subtype we can't decode
 
+    int stream_index_ = -1;  // -1 = MF_SOURCE_READER_FIRST_VIDEO_STREAM
     int lit_metadata_ = -1;  // MF_CAPTURE_METADATA_FRAME_ILLUMINATION, -1 when absent
     double last_mean_ = 0;   // fallback phase detector when metadata is absent
     double peak_mean_ = 0;
