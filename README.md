@@ -16,7 +16,12 @@ Windows Hello IR cameras live in `KSCATEGORY_SENSOR_CAMERA`, which DirectShow do
 - Windows 11, build 22000 or newer (the virtual camera API is `MFCreateVirtualCamera`)
 - A Windows Hello IR camera that Media Foundation enumerates under `KSCATEGORY_SENSOR_CAMERA`
 
-Tested only on a **NexiGo HelloCam N930W**. Other Hello cameras should work if they expose an IR video stream and the FACEAUTH extended control, but that is not verified - reports welcome.
+Verified on:
+
+- **NexiGo HelloCam N930W** (external USB Hello camera; the development target)
+- **ASUS Zenbook DUO UX8406CA-PS99T** (built-in Hello camera)
+
+Other Hello cameras should work if they expose an IR video stream and the FACEAUTH extended control, but that is not verified - reports welcome.
 
 ## Downloads
 
